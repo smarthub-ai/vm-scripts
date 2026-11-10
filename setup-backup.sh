@@ -16,6 +16,12 @@
 #   WASABI_RW_ACCESS_KEY WASABI_RW_SECRET_KEY RESTIC_PASSWORD
 #   RETENTION_HOURLY RETENTION_DAILY RETENTION_WEEKLY
 #   BACKUP_PATHS (newline-joined list of paths to back up)
+# Optional:
+#   PRE_BACKUP_HOOK -- a script on this host the run script runs (as root,
+#                      clean environment) before each snapshot, e.g. a
+#                      database dump into a backed-up path. If it fails the
+#                      snapshot is still taken (with whatever is on disk),
+#                      but the run exits non-zero so systemd shows it.
 #
 # Testable side effects are redirected under these env-var-overridable
 # roots (defaults match where they'd really live on the VM):
@@ -45,6 +51,15 @@ for retention_var in RETENTION_HOURLY RETENTION_DAILY RETENTION_WEEKLY; do
       ;;
   esac
 done
+
+PRE_BACKUP_HOOK="${PRE_BACKUP_HOOK:-}"
+# Baked literally into the run script below: allow only what
+# load_host_config allows.
+if [ -n "$PRE_BACKUP_HOOK" ] && { [[ ! "$PRE_BACKUP_HOOK" =~ ^/[A-Za-z0-9._/+-]+$ ]] \
+     || [[ "/$PRE_BACKUP_HOOK/" == */../* ]] || [[ "/$PRE_BACKUP_HOOK/" == */./* ]]; }; then
+  echo "setup-backup.sh: invalid PRE_BACKUP_HOOK: $PRE_BACKUP_HOOK" >&2
+  exit 1
+fi
 
 install_restic
 
@@ -108,6 +123,23 @@ cat > "$tmp_run" <<RUNSCRIPT
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Pre-backup hook (PRE_BACKUP_HOOK), if set: run with a clean environment,
+# so it never sees the restic password or Wasabi key this run has.
+pre_backup_hook='${PRE_BACKUP_HOOK}'
+hook_rc=0
+if [ -n "\$pre_backup_hook" ]; then
+  if [ -f "\$pre_backup_hook" ]; then
+    env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \\
+      HOME=/root LANG=C.UTF-8 bash "\$pre_backup_hook" || hook_rc=\$?
+  else
+    echo "vm-backup: pre-backup hook \$pre_backup_hook not found" >&2
+    hook_rc=1
+  fi
+  if [ "\$hook_rc" -ne 0 ]; then
+    echo "vm-backup: pre-backup hook failed (exit \$hook_rc); backing up what is on disk anyway" >&2
+  fi
+fi
+
 backup_rc=0
 restic backup --files-from "${VM_BACKUP_ETC}/paths.txt" || backup_rc=\$?
 if [ "\$backup_rc" -ne 0 ] && [ "\$backup_rc" -ne 3 ]; then
@@ -116,7 +148,10 @@ fi
 
 restic forget --prune --keep-hourly ${RETENTION_HOURLY} --keep-daily ${RETENTION_DAILY} --keep-weekly ${RETENTION_WEEKLY}
 
-exit "\$backup_rc"
+if [ "\$backup_rc" -ne 0 ]; then
+  exit "\$backup_rc"
+fi
+exit "\$hook_rc"
 RUNSCRIPT
 chmod 755 "$tmp_run"
 mv -f "$tmp_run" "$VM_BACKUP_BIN_DIR/vm-backup-run.sh"
